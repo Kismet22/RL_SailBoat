@@ -1,0 +1,326 @@
+import gymnasium as gym
+from gym.spaces import Box
+from scipy.io import loadmat
+import numpy as np
+import random
+from heading_controller import heading_controller
+from simulation import *
+from numpy import *
+import matplotlib.pyplot as plt
+from sail_angle import sail_angle
+from time import process_time
+import inspect
+
+deq = solve
+
+''' State中包含的信息包括:
+    POS_X(0), POS_Y(1), POS_Z(2);
+    ROLL(3), PITCH(4), YAW(5);
+    VEL_X(6), VEL_Y(7), VEL_Z(8);
+    ROLL_RATE(9), PITCH_RATE(10), YAW_RATE(11);
+    RUDDER_STATE(12), SAIL_STATE(13);
+'''
+
+"""""""""""""""
+# 常微分方程类声明
+# 暂时用不上
+class simple_integrator(object):
+
+    def __init__(self, deq):
+        self.t = 0
+        self.deq = deq
+        self.max_sample_time = .01
+        pass
+
+    def set_initial_value(self, x0, t0):
+        self.y = x0
+        self.t = t0
+
+    def integrate(self, end_time):
+        while end_time - self.t > 1.1 * self.max_sample_time:
+            self.integrate(self.t + self.max_sample_time)
+
+        self.y += self.deq(self.t, self.y) * (end_time - self.t)
+        self.t = end_time
+"""""
+
+
+# 常微分方程修改
+def deq_sparse(time, state):
+    # ignore pitch and heave oscillations (not really needed)
+    # 修改常微分方程
+    diff = deq(time, state)
+    diff[VEL_Z] = 0
+    diff[PITCH_RATE] = 0
+    diff[ROLL_RATE] = 0
+    return diff
+
+
+# 状态初始化
+def init_data_arrays(n_states, N_steps, x0):
+    x = zeros((n_states, N_steps + 1))  # n_states行，N_steps + 1列
+    r = zeros(N_steps + 1)
+    sail = zeros(N_steps + 1)
+    t = zeros(N_steps + 1)
+    # x0为12个state的初始状态
+    x[:, 0] = x0  # 第一列
+
+    ref_heading = zeros(N_steps + 1)
+    # 返回状态、时间、奖励、帆状态和前进角度
+    return x, t, r, sail, ref_heading
+
+
+# 微分方程初始化
+def init_integrator(x0, sampletime, sparse=False):
+    # init integrator
+    # 是否稀疏化处理
+    fun = deq if not sparse else deq_sparse
+    # 选择模型方法
+    integrator = ode(fun).set_integrator('dopri5')
+    # 初始化状态输入
+    integrator.set_initial_value(x0, 0)
+    # init heading controller
+    controller = heading_controller(sampletime, max_rudder_angle=15 * pi / 180)
+    controller.calculate_controller_params(YAW_TIMECONSTANT)
+
+    return integrator, controller
+
+
+# 平滑处理
+def smooth_reference(ref_heading, n_filter=5):
+    # potential smoothing of heading reference
+    # 拷贝前进角度
+    smoothed = ref_heading.copy()
+    N = ref_heading.shape[0]
+    for i in range(N):
+        # 改为整数除法，避免报错
+        ind_low = max(0, i - n_filter // 2)
+        ind_high = min(N, i + (n_filter - n_filter // 2))
+        smoothed[i] = np.mean(ref_heading[ind_low:ind_high])
+    return smoothed
+
+
+def plot_series(points, end_point=None, fig=None, ax=None, N_subplot=1, n_subplot=1, title=None, xlabel=None,
+                ylabel=None, label=None,
+                legend=False):
+    x_pos = [x for x, y in points]
+    y_pos = [y for x, y in points]
+    if fig is None:
+        fig = plt.figure()
+    if ax is None:
+        ax = fig.add_subplot(N_subplot, 1, n_subplot)
+    ax.plot(x_pos, y_pos, label=label)
+    if end_point is not None:
+        end_x, end_y = end_point
+        ax.scatter(end_x, end_y, color='red', label='End Point')  # 在图上标注终点坐标
+    if not xlabel is None:
+        ax.set_xlabel(xlabel)
+    if not ylabel is None:
+        ax.set_ylabel(ylabel)
+    ax.grid(True)
+
+    if legend:
+        ax.legend()
+    return fig, ax
+
+
+# 计算欧式距离
+def calculate_distance(old, new):
+    distance = abs(sqrt((new[0] - old[0]) ** 2 + (new[1] - old[1]) ** 2))
+    return distance
+
+
+# 随机生成起点
+def random_start():
+    x = random.uniform(-2, 2)
+    y = random.uniform(-2, 2)
+    startpoint = [x, y]
+    return startpoint
+
+
+# 计算两点坐标差
+def calculate_angle(current, target):
+    angle_radians = math.atan2(target[1] - current[1], target[0] - current[0])
+    angle_degrees = math.degrees(angle_radians)
+    angle_degrees = pi * angle_degrees / 180
+    return angle_degrees
+
+
+class Boat_Environment:
+    def __init__(self):
+        # 初始化信息
+        self.break_flag = False
+        self.end_target = None  # 实验，目标坐标点
+        self.environment = None  # 实验，周围环境
+        self.n_states = 12
+        if actor_dynamics:
+            self.n_states = 14
+        # 环境信息
+        self.wind = TrueWind(0, 5, 5, pi / 2)
+        # self.wind = TrueWind(2, 2, sqrt(8), pi / 4)
+        self.t_end = 150.  # 模拟终止时间
+        self.sampletime = .3  # 采样间隔
+        self.sail_sampletime = 2.  # 反应时间
+        self.N_steps = int(self.t_end / self.sampletime)  # 步长
+        self.sail_angle = None
+
+        ############
+        # 设置参考角度
+        """""""""
+        ref_heading = zeros(self.N_steps + 1)
+        # 在中间改变两次前进方向
+        # 目前将ref_heading提前设置
+        ref_heading[int(20 / self.sampletime):] = 1.2 * pi
+        ref_heading[int(60 / self.sampletime):] = .35 * pi
+        """""
+        self.ref_heading = None  # 前进方向
+        ############
+        self.t = 0
+        self.i = 0
+
+        # 保存状态、时间、奖励、帆状态和前进角度
+        """""""""
+        self.state_array = []
+        self.rudder_array = []
+        self.sail_array = []
+        self.t_array = []
+        """
+
+        # 控制器和积分器初始化
+        self.integrator = None
+        self.controller = None
+        environment[SAIL_ANGLE] = 0. / 180 * pi
+        environment[RUDDER_ANGLE] = 0
+        environment[WAVE] = Wave(50, 0, 0)
+        sim_wave = False
+        if sim_wave:
+            environment[WAVE] = Wave(length=100., amplitude=.5, direction=0)
+            append = "_wave"
+        else:
+
+            append = ""
+        environment[TRUE_WIND] = self.wind
+
+    def reset(self):
+        ########
+        # 加入随机设置的起点
+        # target = random_start()
+        target = [60, 60]
+        print('目标位置', target)
+        self.end_target = target
+        ########
+        self.sail_angle = None
+        self.i = 0
+        x0 = zeros(self.n_states)
+        x0[VEL_X] = 0.
+        if actor_dynamics:
+            x0[SAIL_STATE] = 48 * pi / 180
+        integrator, controller = init_integrator(x0, self.sampletime)
+        self.integrator = integrator  # 运动更新器
+        self.controller = controller  # PID状态控制器
+        self.ref_heading = calculate_angle(x0, self.end_target)
+        return x0
+
+    def step(self, x):
+
+        #########
+        # 计算当前距离
+        x_old = x
+        current_distance = calculate_distance(x_old, self.end_target)
+        print('当前位置距离', current_distance)
+        #########
+
+        # self.ref_heading = 0
+        integrator = self.integrator
+        predefined_sail_angle = None
+        # 输入上一个状态x
+        print('position', (x[0], x[1]))
+        # ref_heading 代表的是期望前往的航向
+        # print('heading', self.ref_heading[self.i])
+        print('heading', self.ref_heading)
+
+        #########
+        # PID控制器控制
+        speed = sqrt(x[VEL_X] ** 2 + x[VEL_Y] ** 2)
+        drift = arctan2(x[VEL_Y], x[VEL_X])
+        # x[YAW]中保存当前的航向
+        # environment[RUDDER_ANGLE] = self.controller.controll(self.ref_heading[self.i], x[YAW], x[YAW_RATE], speed,
+        #                                                     x[ROLL], drift_angle=drift)
+        environment[RUDDER_ANGLE] = self.controller.controll(self.ref_heading, x[YAW], x[YAW_RATE], speed,
+                                                             x[ROLL], drift_angle=drift)
+        #########
+
+        #########
+        # RL随机角度输入
+        # random_rudder_angle = random.uniform(-pi*45/180, pi*45/180)  # 在min_angle和max_angle之间生成随机角度
+        # environment[RUDDER_ANGLE] = random_rudder_angle
+        #########
+
+        # 船体舵角(action1)
+        rudder = environment[RUDDER_ANGLE]
+        print('rudder_angle', rudder)
+
+        if not predefined_sail_angle is None:
+            sail = predefined_sail_angle
+            self.sail_angle = sail
+            environment[SAIL_ANGLE] = sail  # 目标角度
+        # 当前的时间步数是 sail_sampletime（风帆控制采样时间）的整数倍时，控制器会计算新的风帆角度
+        else:
+            if not self.i % int(self.sail_sampletime / self.sampletime):
+                # 添加当前风的影响
+                apparent_wind = calculate_apparent_wind(x[YAW], x[VEL_X], x[VEL_Y], self.wind)
+                environment[SAIL_ANGLE] = sail_angle(apparent_wind.angle, apparent_wind.speed, SAIL_STRETCHING)
+
+                sail = environment[SAIL_ANGLE]
+                self.sail_angle = sail
+
+            else:
+                sail = self.sail_angle
+
+        # 船体帆角(action2)
+        print('sail_angle:', sail)
+        print('next_state:', integrator.y)
+        # 通过积分器更新下一个状态
+        # state状态更新
+        integrator.integrate(integrator.t + self.sampletime)
+        # print('integrator.y after integration:', integrator.y)
+        # t = self.integrator.t
+        x_new = self.integrator.y
+        # self.t = t
+        # 保存更新的integrator
+        self.integrator = integrator
+        self.i = self.i + 1
+        # 更新期望角度
+        #self.ref_heading = calculate_angle(x_new, self.end_target)
+
+        #########
+        # 计算两次运动的距离
+        distance = calculate_distance(x_old, x_new)
+        print('两次运动的距离', distance)
+        #########
+
+        return x_new
+
+
+def main():
+    state_array = []
+    environment = Boat_Environment()
+    state = environment.reset()
+    temp_state = (state[0], state[1])
+    state_array.append(temp_state)
+    # start_time = process_time()
+    for i in range(environment.N_steps):
+        print(i)
+        state = environment.step(state)
+        temp_state = (state[0], state[1])
+        state_array.append(temp_state)
+    # end_time = process_time()
+    # print('computation time', end_time - start_time)
+    fig, ax = plot_series(state_array, end_point=environment.end_target, title='trajectory Plot', xlabel='pos_x',
+                          ylabel='pos_y', label='trajectory',
+                          legend=True)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
