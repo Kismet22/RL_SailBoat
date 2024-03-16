@@ -1,0 +1,1235 @@
+import gymnasium as gym
+from gym.spaces import Box
+# matlab数据加载
+from scipy.io import loadmat
+import numpy as np
+from time import process_time
+import random
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.env_checker import check_env
+
+from heading_controller import heading_controller
+from simulation import *
+from numpy import *
+import matplotlib.pyplot as plt
+from sail_angle import sail_angle
+import copy
+import matplotlib.patches as patches
+
+import torch
+import os
+
+deq = solve
+
+dir_pic = './pic/'
+dir_model = './model/'
+
+''' State中包含的信息包括:
+    POS_X(0), POS_Y(1), POS_Z(2);
+    ROLL(3), PITCH(4), YAW(5);
+    VEL_X(6), VEL_Y(7), VEL_Z(8);
+    ROLL_RATE(9), PITCH_RATE(10), YAW_RATE(11);
+    RUDDER_STATE(12), SAIL_STATE(13);
+    YAW是帆船的当前舵角
+'''
+
+"""""""""""""""
+# 常微分方程类声明
+# 暂时用不上
+class simple_integrator(object):
+
+    def __init__(self, deq):
+        self.t = 0
+        self.deq = deq
+        self.max_sample_time = .01
+        pass
+
+    def set_initial_value(self, x0, t0):
+        self.y = x0
+        self.t = t0
+
+    def integrate(self, end_time):
+        while end_time - self.t > 1.1 * self.max_sample_time:
+            self.integrate(self.t + self.max_sample_time)
+
+        self.y += self.deq(self.t, self.y) * (end_time - self.t)
+        self.t = end_time
+"""""
+
+
+# 自定义回调函数
+class CustomCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(CustomCallback, self).__init__(verbose)
+
+    def _on_step(self):
+        # 在每个训练步骤之后被调用
+        # 可以在这里访问模型、环境、动作等信息
+        # 并进行相应的操作和记录
+
+        # 示例：打印当前训练步数和最近一次的回报值
+        print("Step:", self.num_timesteps)
+        print("Recent reward:", self.locals['rewards'][-1])
+
+        return True  # 返回True以继续训练，返回False以停止训练
+
+
+# 常微分方程修改
+def deq_sparse(time, state):
+    # ignore pitch and heave oscillations (not really needed)
+    # 修改常微分方程
+    diff = deq(time, state)
+    diff[VEL_Z] = 0
+    diff[PITCH_RATE] = 0
+    diff[ROLL_RATE] = 0
+    return diff
+
+
+# 状态初始化
+def init_data_arrays(n_states, N_steps, x0):
+    x = zeros((n_states, N_steps + 1))  # n_states行，N_steps + 1列
+    r = zeros(N_steps + 1)
+    sail = zeros(N_steps + 1)
+    t = zeros(N_steps + 1)
+    # x0为12个state的初始状态
+    x[:, 0] = x0  # 第一列
+
+    ref_heading = zeros(N_steps + 1)
+    # 返回状态、时间、奖励、帆状态和前进角度
+    return x, t, r, sail, ref_heading
+
+
+# 微分方程初始化
+def init_integrator(x0, sampletime, sparse=False):
+    # init integrator
+    # 是否稀疏化处理
+    fun = deq if not sparse else deq_sparse
+    # 选择模型方法
+    integrator = ode(fun).set_integrator('dopri5')
+    # 初始化状态输入
+    integrator.set_initial_value(x0, 0)
+    # init heading controller
+    controller = heading_controller(sampletime, max_rudder_angle=15 * pi / 180)
+    controller.calculate_controller_params(YAW_TIMECONSTANT)
+
+    return integrator, controller
+
+
+# 平滑处理
+def smooth_reference(ref_heading, n_filter=5):
+    # potential smoothing of heading reference
+    # 拷贝前进角度
+    smoothed = ref_heading.copy()
+    N = ref_heading.shape[0]
+    for i in range(N):
+        # 改为整数除法，避免报错
+        ind_low = max(0, i - n_filter // 2)
+        ind_high = min(N, i + (n_filter - n_filter // 2))
+        smoothed[i] = np.mean(ref_heading[ind_low:ind_high])
+    return smoothed
+
+
+def plot_series(points, end_point=None, fig=None, ax=None, N_subplot=1, n_subplot=1, title=None, xlabel=None,
+                ylabel=None, label=None,
+                legend=False, wind=None):
+    x_pos = [x for x, y in points]
+    y_pos = [y for x, y in points]
+    if fig is None:
+        fig = plt.figure()
+    if ax is None:
+        ax = fig.add_subplot(N_subplot, 1, n_subplot)
+    ax.plot(x_pos, y_pos, label=label)
+    if end_point is not None:
+        end_x, end_y = end_point
+        ax.scatter(end_x, end_y, color='red', label='End Point')  # 在图上标注终点坐标
+        ax.scatter(0, 0, color='blue', label='Start Point')  # 在图上标注终点坐标
+    if wind is not None:
+        arrow_start = (0, 0)
+        arrow_end = (wind.x, wind.y)
+        arrow = patches.FancyArrowPatch(arrow_start, arrow_end, color='green', arrowstyle='-|>')
+        ax.add_patch(arrow)
+
+    if not xlabel is None:
+        ax.set_xlabel(xlabel)
+    if not ylabel is None:
+        ax.set_ylabel(ylabel)
+    ax.grid(True)
+
+    if legend:
+        ax.legend()
+    return fig, ax
+
+
+# 计算欧式距离
+def calculate_distance(old, new):
+    distance = abs(sqrt((new[0] - old[0]) ** 2 + (new[1] - old[1]) ** 2))
+    return distance
+
+
+# 随机生成起点
+def random_start():
+    x = random.uniform(3, 5)
+    y = random.uniform(3, 5)
+    startpoint = [x, y]
+    print("目标终点为:", startpoint)
+    return startpoint
+
+
+# 计算两点坐标差
+def calculate_angle(current, target):
+    angle_radians = math.atan2(target[1] - current[1], target[0] - current[0])
+    angle_degrees = math.degrees(angle_radians)
+    angle_degrees = pi * angle_degrees / 180
+    return angle_degrees
+
+
+class Boat_Environment(gym.Env):
+    def __init__(self, render_mode='human'):
+        print("加载环境")
+        ############
+        # 初始化信息
+        self.success_flag = False  # 到达终点的标志
+        self.over_flag = False  # 时间用完标志
+        self.success_reward = 2000
+        self.fail_punishment = -200
+
+        # 在初始化时设置好目标点
+        ############
+        self.end_target = [0, 0]  # 实验，目标坐标点
+        # self.end_target = random_start()
+        ############
+
+        self.environment = None  # 实验，周围环境
+        self.render_time = []
+        self.render_positions = []
+        self.render_mode = render_mode
+        ############
+
+        ############
+        # sb3需要的参数
+        self.reward = None
+        self.observation = None  # 观测的state
+        # self.done = False
+        # self.over = False
+        self.info = None
+        # 定义状态空间和动作空间
+        self.observation_space = gym.spaces.box.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float64)
+        self.action_space: Box = gym.spaces.box.Box(low=-np.pi, high=np.pi, shape=(1,), dtype=np.float32)
+        ############
+
+        self.sail_angle = None
+        self.state = None  # 实际使用的state
+        self.n_states = 12
+        if actor_dynamics:
+            self.n_states = 14
+        self.i = 0
+
+        ############
+        # 环境信息
+        self.wind = TrueWind(0, 5, 5, pi / 2)
+        self.t_end = 150.  # 模拟终止时间
+        self.sampletime = .3  # 采样间隔
+        self.sail_sampletime = 2.  # 反应时间
+        self.N_steps = int(self.t_end / self.sampletime)  # 步长
+        self.render_time = []
+        self.render_positions = []
+        ############
+
+        ############
+        # 在RL环境中用不上
+        self.ref_heading = None  # 前进方向
+        ############
+
+        ############
+        # 控制器和积分器初始化
+        self.integrator = None
+        self.controller = None
+        environment[SAIL_ANGLE] = 0. / 180 * pi
+        environment[RUDDER_ANGLE] = 0
+        environment[WAVE] = Wave(50, 0, 0)
+        sim_wave = False
+        if sim_wave:
+            environment[WAVE] = Wave(length=100., amplitude=.5, direction=0)
+            append = "_wave"
+        else:
+            append = ""
+        environment[TRUE_WIND] = self.wind
+        ############
+
+    def reset(self, seed=None, options=None):
+        print("环境初始化")
+        print("风速为", self.wind[2])
+        ########
+        self.success_flag = False  # 到达终点的标志
+        self.over_flag = False  # 时间用完标志
+        ########
+
+        ########
+        # 加入随机设置的起点
+        # 后续还需要更改
+        # self.end_target = random_start()
+        self.end_target = [6, 3]
+        target = self.end_target
+        print('目标位置', target)
+        self.sail_angle = None
+        ########
+
+        ########
+        # 状态记录
+        self.i = 0
+        x0 = zeros(self.n_states)
+        x0[VEL_X] = 0.
+
+        # 设置起点
+        ##############################
+        x0[POS_X] = target[0] - 2
+        x0[POS_Y] = target[1] - 2
+        print('起点为', [x0[POS_X], x0[POS_Y]])
+        #############################
+
+        if actor_dynamics:
+            x0[SAIL_STATE] = 48 * pi / 180
+        integrator, controller = init_integrator(x0, self.sampletime)
+        self.integrator = integrator  # 运动更新器
+        self.controller = controller  # PID状态控制器
+        self.ref_heading = calculate_angle(x0, self.end_target)
+        self.state = x0
+        # observation相对位置
+        x_state = copy.deepcopy(self.state)  # 创建self.state的深拷贝
+        ########
+
+        ########
+        # 实际使用到的observation
+        x_state[0] = self.end_target[0] - x_state[0]  # 将绝对位置坐标改为相对位置坐标
+        x_state[1] = self.end_target[1] - x_state[1]
+        observation = np.array([x_state[0], x_state[1], x_state[3], x_state[4], x_state[5], x_state[6], x_state[7]],
+                               dtype=float64)
+        info = {}
+        self.observation = observation
+        ########
+
+        return observation, info
+
+    def step(self, action):
+
+        ########
+        # 每次更新之前重置终止标志
+        self.success_flag = False  # 到达终点的标志
+        self.over_flag = False  # 时间用完标志
+        info = {}
+        ########
+
+        #########
+        # 计算当前距离
+        x = copy.deepcopy(self.state)  # 创建self.state的深拷贝
+        x_old = copy.deepcopy(self.state)  # 创建self.state的深拷贝
+        # 上一个状态离终点的距离
+        distance_old = calculate_distance(x_old, self.end_target)
+        #########
+
+        #########
+        # 积分器
+        integrator = self.integrator
+        predefined_sail_angle = None
+        #########
+
+        #########
+        # 输入上一个状态x
+        # print('position', (x[0], x[1]))
+        # ref_heading 代表的是期望前往的航向
+        # print('heading', self.ref_heading[self.i])
+        # print('expected_heading', self.ref_heading)
+        #########
+
+        # 运动的动作
+        environment[RUDDER_ANGLE] = action
+
+        # PID
+        """""""""
+        #########
+        # PID控制器控制
+        speed = sqrt(x[VEL_X] ** 2 + x[VEL_Y] ** 2)
+        drift = arctan2(x[VEL_Y], x[VEL_X])
+        # x[YAW]中保存当前的航向
+        # environment[RUDDER_ANGLE] = self.controller.controll(self.ref_heading[self.i], x[YAW], x[YAW_RATE], speed,
+        #                                                     x[ROLL], drift_angle=drift)
+        environment[RUDDER_ANGLE] = self.controller.controll(self.ref_heading, x[YAW], x[YAW_RATE], speed,
+                                                             x[ROLL], drift_angle=drift)
+        #########
+        """
+
+        # 随机角度
+        """""""""
+        #########
+        # RL随机角度输入
+        #random_rudder_angle = random.uniform(-2*pi, 2*pi)  # 在min_angle和max_angle之间生成随机角度
+        #environment[RUDDER_ANGLE] = random_rudder_angle
+        #########
+        """
+
+        # 船体舵角(action1)
+        rudder = environment[RUDDER_ANGLE]
+        # print('rudder_angle', rudder)
+
+        # 船体帆角(action2)
+        if not predefined_sail_angle is None:
+            sail = predefined_sail_angle
+            self.sail_angle = sail
+            environment[SAIL_ANGLE] = sail  # 目标角度
+        # 当前的时间步数是 sail_sampletime（风帆控制采样时间）的整数倍时，控制器会计算新的风帆角度
+        else:
+            if not self.i % int(self.sail_sampletime / self.sampletime):
+                # 添加当前风的影响
+                apparent_wind = calculate_apparent_wind(x[YAW], x[VEL_X], x[VEL_Y], self.wind)
+                environment[SAIL_ANGLE] = sail_angle(apparent_wind.angle, apparent_wind.speed, SAIL_STRETCHING)
+
+                sail = environment[SAIL_ANGLE]
+                self.sail_angle = sail
+
+            else:
+                sail = self.sail_angle
+        # print('sail_angle:', sail)
+
+        #########
+        # 通过积分器更新下一个状态
+        # state状态更新
+        integrator.integrate(integrator.t + self.sampletime)
+        x_new = self.integrator.y
+        self.state = x_new
+        # 保存更新的integrator
+        self.integrator = integrator
+        x_state = copy.deepcopy(self.state)  # 创建self.state的深拷贝
+        #########
+
+        t_step = self.i
+        # 环境截断
+        if t_step > 498:
+            self.over_flag = True
+        # 更新期望角度
+        self.ref_heading = calculate_angle(x_new, self.end_target)
+
+        #########
+        # 计算更新后的距离
+        distance_new = calculate_distance(x_new, self.end_target)
+        if distance_new < 0.2:
+            self.success_flag = True
+        #########
+
+        #########
+        # 计算两次运动的距离
+        # distance = calculate_distance(x_old, x_new)
+        # print('两次运动的距离', distance)
+        #########
+
+        #########
+        # 更新输出的observation
+        x_state[0] = self.end_target[0] - x_state[0]
+        x_state[1] = self.end_target[1] - x_state[1]
+        # observation仍然是相对位置
+        observation = np.array([x_state[0], x_state[1], x_state[3], x_state[4], x_state[5], x_state[6], x_state[7]],
+                               dtype=float64)
+        #########
+
+        #########
+        # 计算奖励函数
+        time_punish = -self.sampletime  # 时间惩罚项
+        distance_reward = 10 * (distance_old - distance_new) / self.sampletime  # 距离奖励项
+        dynamics_reward = 0  # 其他力学奖励项
+        reward = time_punish + distance_reward + dynamics_reward
+        if self.over_flag:
+            reward = self.fail_punishment
+            print("time runs out", reward)
+        elif self.success_flag:
+            reward = reward + self.success_reward
+            print("success", reward)
+        else:
+            reward = reward
+        #########
+
+        #########
+        # save_info
+        info['step'] = self.i
+        info['action'] = action
+        info['success'] = self.success_flag
+        info['rudder_angle'] = rudder
+        info['sail-angle'] = sail
+        info['old_position'] = [x_old[0], x_old[1]]
+        info['new_position'] = [self.state[0], self.state[1]]
+        info['reward'] = reward
+        #########
+
+        #########
+        # state_update
+        self.i = self.i + 1
+        self.observation = observation
+        self.reward = reward
+        terminated = self.success_flag or self.over_flag
+        truncated = self.over_flag
+        self.info = info
+        #########
+
+        return observation, reward, terminated, truncated, info
+
+    def render(self):
+        self.render_time.append(self.i)
+        self.render_positions.append((self.state[0], self.state[1]))
+
+    def close(self):
+        print("Environment closed.")
+
+    def return_time(self):
+        return self.i
+
+
+这两个参数的关系在于，算法会在 total_timesteps 步数内，根据 n_steps 的步数进行若干次交互和更新。例如，如果 total_timesteps 为 1,000,000 步，n_steps 为 256 步，那么在训练过程中，模型会与环境交互大约 1,000,000 / 256 ≈ 3906 次（向下取整），每次交互会收集 256 步的经验，然后根据这 256 步的经验进行一次更新。
+
+每n_steps进行一次更新，如果没有到终点会从上一次的点继续走，如果到了终点会重置
+
+# CallBack函数
+# 自定义回调函数
+# 动态调整clip
+# 初始的Clip范围
+initial_clip_range = 0.2
+
+
+class CustomCallback(BaseCallback):
+    def __init__(self, clip_range=initial_clip_range, verbose=0):
+        super(CustomCallback, self).__init__(verbose)
+        self.clip_range = clip_range
+        self.episode_rewards = []
+
+    def _on_step(self) -> bool:
+        # 每个训练步骤结束后记录奖励
+        current_reward = np.mean(self.locals['rewards'])
+        self.episode_rewards.append(current_reward)
+
+        # 出现done的条件:时间走完或者到达终点
+        if self.locals['dones']:
+            # 当 episode 结束时，计算整个 episode 的平均奖励
+            episode_sum_reward = np.sum(self.episode_rewards)
+            print("当前episode总奖励", episode_sum_reward)
+            # 根据整个 episode 的平均奖励来动态调整Clip范围
+            if episode_sum_reward > 0:
+                if self.clip_range >= 0.1:
+                    self.clip_range = self.clip_range - 0.01
+            print("调整后的clip", self.clip_range)
+            # 清空奖励记录，准备下一个 episode 的记录
+            self.episode_rewards = []
+            # 设置模型的Clip范围
+            self.model.policy.clip_range_vf = self.clip_range
+        return True  # 继续训练
+
+
+def random_start():
+    # 目标区域在一个圆形的范围内
+    # 生成随机角度
+    angle = random.uniform(0, 2 * math.pi)
+    # 生成随机半径，半径小于等于0.5
+    radius = random.uniform(0, 0.5)
+    # 将极坐标转换为直角坐标
+    x = 3 + radius * math.cos(angle)
+    y = 3 + radius * math.sin(angle)
+    # x = random.uniform(2.2, 2.4)
+    # y = random.uniform(3, 3.2)
+    # x = random.choice([2.2, 2.4])
+    # y = random.choice([2.2, 2.4])
+    # x = 3
+    # y = 4
+    startpoint = [x, y]
+    # print("目标终点为:", startpoint)
+    return startpoint
+
+
+
+import os
+import subprocess
+import smarties as rl
+
+# MPI 安装路径
+mpi_path = "C:/Program Files/Microsoft MPI"
+
+# smarties 代码路径
+smarties_path = "F:/研究生/研0/boat/simulator/stda-sailboat-simulator-master/src/smarties"
+
+# 创建 build 目录用于存放编译生成的文件
+build_path = os.path.join(smarties_path, "build")
+os.makedirs(build_path, exist_ok=True)
+
+# 进入 build 目录
+os.chdir(build_path)
+
+# 构建 CMake 命令
+cmake_command = f"cmake -DENABLE_MPI=ON -DMPI_CXX_COMPILER=mpic++ -DCMAKE_PREFIX_PATH={mpi_path} {smarties_path}"
+
+# 调用 subprocess.run 执行 CMake 命令
+subprocess.run(cmake_command, shell=True)
+
+# 使用 make 命令编译项目，这里假设你使用的是 Makefile
+make_command = "make"
+subprocess.run(make_command, shell=True)
+
+
+
+MPC_Controller
+def mpc_model(boat, rudder):
+    x1 = boat[0]
+    x2 = boat[1]
+    delta_x1 = rudder * 0.5
+    delta_x2 = rudder * 1
+    delta_boat = [delta_x1, delta_x2]
+    return delta_boat
+
+
+# MPC控制器
+def mpc_controller(initial_state, target, horizon_length):
+    current_state = initial_state[:]
+    controls = []
+
+    for _ in range(horizon_length):
+        # 在当前状态下，计算控制输入
+        rudder = compute_control(current_state, target)
+        controls.append(rudder)
+
+        # 使用MPC模型更新当前状态
+        delta_state = mpc_model(current_state, rudder)
+        current_state = [current_state[i] + delta_state[i] for i in range(len(current_state))]
+
+    return controls
+
+
+# 计算控制输入（舵角），这里仅是一个示例
+def compute_control(current_state, target):
+    # 在这个简单的示例中，我们可以假设舵角是根据目标位置和当前位置之间的差异来计算的
+    # 例如，如果目标位置在当前位置的左边，舵角向左转；如果在右边，舵角向右转
+    # 在实际应用中，通常需要更复杂的控制策略
+    current_position = current_state[0]  # 仅考虑x坐标
+    target_position = target[0]  # 仅考虑x坐标
+    if target_position < current_position:
+        return -1  # 向左转
+    elif target_position > current_position:
+        return 1  # 向右转
+    else:
+        return 0  # 不转动
+
+
+# 初始状态和目标位置
+initial_state = [0, 0]  # 初始位置
+target_position = [10, 0]  # 目标位置
+horizon_length = 10  # MPC预测的时间步长
+
+# 执行MPC控制
+controls = mpc_controller(initial_state, target_position, horizon_length)
+
+# 打印控制输入
+print("控制输入序列：", controls)
+
+
+import casadi as ca
+
+# 定义符号变量
+x1 = ca.MX.sym('x1')
+x2 = ca.MX.sym('x2')
+rudder = ca.MX.sym('rudder')
+
+
+# 定义MPC模型
+def mpc_model(x1, x2, rudder):
+    delta_x1 = rudder * 0.5
+    delta_x2 = rudder * 1
+    delta_boat = [delta_x1, delta_x2]
+    return delta_boat
+
+
+# 包装模型为 CasADi 函数
+mpc_model_func = ca.Function('mpc_model', [x1, x2, rudder], [mpc_model(x1, x2, rudder)])
+
+# 创建一个Opti问题
+opti = ca.Opti()
+
+# 定义决策变量
+rudder_var = opti.variable()
+
+# 添加约束
+opti.subject_to(rudder_var <= 1)
+opti.subject_to(rudder_var >= -1)
+
+# 添加成本
+cost = opti.minimize(mpc_model_func(x1, x2, rudder_var)[0])  # 修正成本函数的调用方式
+
+# 求解问题
+opti.solver('ipopt')
+sol = opti.solve()
+
+# 输出结果
+print("最优rudder值:", sol.value(rudder_var))
+
+
+##########################################################################
+## 积分器测试
+from scipy.integrate import ode
+
+prev_t = 0
+prev_pos_y = 0
+prev_delta_y = 0
+
+
+# 定义微分方程的右侧
+def fun(t, boat):
+    global prev_t, prev_pos_y, prev_delta_y  # 使用全局变量
+    print("time", t)
+    print("prev_t", prev_t)
+    print("prev_pos", prev_pos_y)
+    print("prev_delta", prev_delta_y)
+    print("test_pos_x", prev_pos_y + prev_delta_y * (t - prev_t))
+
+    # time = t时的boat位置
+    print("true_boat_y", boat[1])
+    pos_x, pos_y, pos_z = boat[0:3]
+    delta_x = 0.5
+    delta_y = 1
+    delta_z = 2
+    delta_boat = [delta_x, delta_y, delta_z]
+
+    print("delta_y", delta_boat[1])
+    print("_________________________________________________")
+    prev_t = t
+    prev_pos_y = boat[1]
+    prev_delta_y = delta_boat[1]
+    return delta_boat
+
+
+# 设置积分器
+integrator = ode(fun).set_integrator('dopri5', nsteps=100)
+
+# 初始化状态
+boat_initial_state = [0.0, 0.0, 0.0]  # 初始状态 [pos_x, pos_y, pos_z]
+t0 = 0.0  # 初始时间 t = 0
+integrator.set_initial_value(boat_initial_state, t0)
+
+# 定义积分时间
+t_end = 1.0
+dt = 0.1  # 积分时间步长
+
+# 积分并输出结果
+while integrator.successful() and integrator.t < t_end:
+    integrator.integrate(integrator.t + dt)
+    print(f"t={integrator.t}, boat={integrator.y}")
+
+
+"""""""""""""""
+# 常微分方程类声明
+# 暂时用不上
+class simple_integrator(object):
+
+    def __init__(self, deq):
+        self.t = 0
+        self.deq = deq
+        self.max_sample_time = .01
+        pass
+
+    def set_initial_value(self, x0, t0):
+        self.y = x0
+        self.t = t0
+
+    def integrate(self, end_time):
+        while end_time - self.t > 1.1 * self.max_sample_time:
+            self.integrate(self.t + self.max_sample_time)
+
+        self.y += self.deq(self.t, self.y) * (end_time - self.t)
+        self.t = end_time
+"""""
+
+# 平滑处理
+def smooth_reference(ref_heading, n_filter=5):
+    # potential smoothing of heading reference
+    # 拷贝前进角度
+    smoothed = ref_heading.copy()
+    N = ref_heading.shape[0]
+    for i in range(N):
+        # 改为整数除法，避免报错
+        ind_low = max(0, i - n_filter // 2)
+        ind_high = min(N, i + (n_filter - n_filter // 2))
+        smoothed[i] = np.mean(ref_heading[ind_low:ind_high])
+    return smoothed
+
+# 状态初始化
+def init_data_arrays(n_states, N_steps, x0):
+    x = zeros((n_states, N_steps + 1))  # n_states行，N_steps + 1列
+    r = zeros(N_steps + 1)
+    sail = zeros(N_steps + 1)
+    t = zeros(N_steps + 1)
+    # x0为12个state的初始状态
+    x[:, 0] = x0  # 第一列
+
+    ref_heading = zeros(N_steps + 1)
+    # 返回状态、时间、奖励、帆状态和前进角度
+    return x, t, r, sail, ref_heading
+
+
+
+###########  MPC示例  ################
+import gymnasium as gym
+from gym.spaces import Box
+from scipy.optimize import minimize
+# matlab数据加载
+from scipy.io import loadmat
+import numpy as np
+from time import process_time
+import random
+from heading_controller import heading_controller
+from simulation import *
+from numpy import *
+import matplotlib.pyplot as plt
+import copy
+
+deq = solve
+
+''' State中包含的信息包括:
+    POS_X(0), POS_Y(1), POS_Z(2);
+    ROLL(3), PITCH(4), YAW(5);
+    VEL_X(6), VEL_Y(7), VEL_Z(8);
+    ROLL_RATE(9), PITCH_RATE(10), YAW_RATE(11);
+    RUDDER_STATE(12), SAIL_STATE(13);
+    YAW是帆船的当前舵角
+'''
+
+
+def plot_series(points, end_point=None, fig=None, ax=None, N_subplot=1, n_subplot=1, title=None, xlabel=None,
+                ylabel=None, label=None,
+                legend=False):
+    x_pos = [x for x, y in points]
+    y_pos = [y for x, y in points]
+    if fig is None:
+        fig = plt.figure()
+    if ax is None:
+        ax = fig.add_subplot(N_subplot, 1, n_subplot)
+    ax.plot(x_pos, y_pos, label=label)
+    if end_point is not None:
+        end_x, end_y = end_point
+        ax.scatter(end_x, end_y, color='red', label='End Point')  # 在图上标注终点坐标
+        ax.scatter(0, 0, color='blue', label='Start Point')  # 在图上标注终点坐标
+    if not xlabel is None:
+        ax.set_xlabel(xlabel)
+    if not ylabel is None:
+        ax.set_ylabel(ylabel)
+    ax.grid(True)
+
+    if legend:
+        ax.legend()
+    return fig, ax
+
+
+# 随机生成起点
+def random_start():
+    x = random.uniform(-5, 5)
+    y = random.uniform(-5, 5)
+    startpoint = [x, y]
+    return startpoint
+
+
+def sail_angle_1(wind_angle, wind_speed, sail_stretching, limit_wind_speed=6, stall_deg=14.):
+    # opt_aoa = tan(wind_angle) * sail_stretching / 4
+
+    # Optimal Angle of Attack,最优攻角
+    opt_aoa = sin(wind_angle) / (cos(wind_angle) + .4 * cos(wind_angle) ** 2) * sail_stretching / 4
+
+    # 最大攻角限制
+    if abs(opt_aoa) > stall_deg / 180. * pi:
+        opt_aoa = sign(wind_angle) * stall_deg / 180. * pi
+    # heading controllability at high wind speeds:
+    # 最高风速限制
+    if wind_speed > limit_wind_speed:
+        fact = (limit_wind_speed / wind_speed) ** 2
+        opt_aoa *= fact
+
+    return abs(clip(wind_angle - opt_aoa, -pi / 2, pi / 2))
+
+
+def system_dynamics(boat, rudder):
+    delta_time = 0.3
+    actor_dynamics = False
+    time = boat[12]
+    i = int(time/delta_time)
+    print(i)
+    print("current_time", time)
+    if not i % int(2 / delta_time):
+        print("sail_change")
+        apparent_wind = calculate_apparent_wind(boat[YAW], boat[VEL_X], boat[VEL_Y], environment[TRUE_WIND])
+        environment[SAIL_ANGLE] = sail_angle_1(apparent_wind.angle, apparent_wind.speed, SAIL_STRETCHING)
+    environment[RUDDER_ANGLE] = rudder
+    pos_x, pos_y, pos_z = boat[POS_X: POS_Z + 1]
+    roll, pitch, yaw = boat[ROLL: YAW + 1]
+    vel_x, vel_y, vel_z = boat[VEL_X: VEL_Z + 1]
+    roll_rate, pitch_rate, yaw_rate = boat[ROLL_RATE: YAW_RATE + 1]
+
+    # 考虑船体力学信息的影响
+    if actor_dynamics:
+        rudder_angle, sail_angle = boat[RUDDER_STATE: SAIL_STATE + 1]
+        # environment unpacking
+        sail_angle_reference = environment[SAIL_ANGLE]  # environment中存储sail_angle位置的元素
+        rudder_angle_reference = environment[RUDDER_ANGLE]  # environment中存储rudder_angle位置的元素
+        # 存储的是上一次的舵角数据
+    else:
+        sail_angle = environment[SAIL_ANGLE]
+        rudder_angle = environment[RUDDER_ANGLE]
+
+    wave = environment[WAVE]
+    true_wind = environment[TRUE_WIND]
+
+    """
+    For force calulations needed values
+    运动学信息、力学信息
+    """
+    # 实际船速
+    # 只考虑二维平面中速度
+    speed = sqrt(vel_x ** 2 + vel_y ** 2)  # + vel_z**2)
+    # 波浪影响
+    wave_influence = calculate_wave_influence(pos_x, pos_y, yaw, wave, time)
+    # 视风
+    apparent_wind = calculate_apparent_wind(yaw, vel_x, vel_y, true_wind)
+
+    # sail angle is determined from rope length and wind direction
+    # 顺/逆风 × 帆角的绝对值
+    true_sail_angle = np.sign(apparent_wind.angle) * abs(sail_angle)
+
+    # Force calculation
+    # 阻尼
+    damping = calculate_damping(vel_x, vel_y, vel_z, roll_rate, pitch_rate, yaw_rate)
+    # 流体静力
+    hydrostatic_force, x_hs, y_hs = calculate_hydrostatic_force(pos_z, roll, pitch, wave_influence)
+
+    # 波浪阻抗
+    wave_impedance = calculate_wave_impedance(vel_x, speed)
+    # 龙骨力
+    rudder_force = calculate_rudder_force(speed, rudder_angle)
+    # 横向力
+    lateral_force, lateral_separation = calculate_lateral_force(vel_x, vel_y, roll, speed)
+    # lateral_separation = 0
+    sail_force = calculate_sail_force(roll, apparent_wind, true_sail_angle)
+
+    # Calculate changes
+    # 位置一阶导数
+    delta_pos_x = vel_x * cos(yaw) - vel_y * sin(yaw)
+    delta_pos_y = vel_y * cos(yaw) + vel_x * sin(yaw)
+    delta_pos_z = vel_z
+    # 角度一阶导数
+    delta_roll = roll_rate
+    delta_pitch = pitch_rate * cos(roll) - yaw_rate * sin(roll)
+    delta_yaw = yaw_rate * cos(roll) + pitch_rate * sin(roll)
+
+    # 位置二阶导数
+    delta_vel_x = delta_yaw * vel_y + (
+            sail_force.x + lateral_force.x + rudder_force.x + damping.x + wave_impedance + hydrostatic_force.x) / MASS
+
+    delta_vel_y = -delta_yaw * vel_x + \
+                  ((sail_force.y + lateral_force.y + rudder_force.y) * cos(roll) +
+                   hydrostatic_force.y +
+                   damping.y) / MASS
+
+    delta_vel_z = ((sail_force.y + lateral_force.y + rudder_force.y) * sin(roll) +
+                   hydrostatic_force.z - GRAVITY_FORCE + damping.z) / MASS
+    # MASS * GRAVITY + damping.z) / MASS
+
+    # 角度二阶导数
+    delta_roll_rate = (hydrostatic_force.z * y_hs
+                       - sail_force.y * SAIL_PRESSURE_POINT_HEIGHT
+                       + damping.roll) / MOI_X
+
+    delta_pitch_rate = (sail_force.x * SAIL_PRESSURE_POINT_HEIGHT
+                        - hydrostatic_force.z * x_hs * cos(roll)
+                        + damping.pitch
+                        - (MOI_X - MOI_Z) * roll_rate * yaw_rate) / MOI_Y
+
+    delta_yaw_rate = (damping.yaw
+                      # + hydrostatic_force.z * hydrostatic_force.x * sin(roll)
+                      - rudder_force.y * DISTANCE_COG_RUDDER
+                      + sail_force.y * DISTANCE_COG_SAIL_PRESSURE_POINT
+                      + sail_force.x * sin(true_sail_angle) * DISTANCE_MAST_SAIL_PRESSURE_POINT
+                      + lateral_force.y * (DISTANCE_COG_KEEL_PRESSURE_POINT * (1 - lateral_separation)
+                                           + DISTANCE_COG_KEEL_MIDDLE * lateral_separation)) / MOI_Z
+
+    if actor_dynamics:
+        print("b_rudder", rudder_angle)
+        print("e_rudder", rudder_angle_reference)
+        # actor dynamics
+        # delta_rudder是船实际的舵角和本次action的期望舵角的差值
+        delta_rudder = - 2 * (rudder_angle - rudder_angle_reference)
+        max_rudder_speed = pi / 30
+        # if delta_rudder > max_rudder_speed:
+        # print delta_rudder, max_rudder_speed
+        delta_rudder = np.clip(delta_rudder, -max_rudder_speed, max_rudder_speed)
+        print("delta_rudder", delta_rudder)
+        print("plus", rudder_angle + delta_rudder)
+
+        delta_sail = - .1 * (sail_angle - sail_angle_reference)
+        max_sail_speed = pi / 10
+        delta_sail = np.clip(delta_sail, -max_sail_speed, max_sail_speed)
+
+    # delta中，保存了船体速度和角度的一阶信息和二阶信息
+    # 以全局坐标为参考系
+    delta = np.array(
+        [delta_pos_x, delta_pos_y, delta_pos_z,
+         delta_roll, delta_pitch, delta_yaw,
+         delta_vel_x, delta_vel_y, delta_vel_z,
+         delta_roll_rate, delta_pitch_rate, delta_yaw_rate, delta_time])
+
+    if actor_dynamics:
+        delta = np.concatenate((delta, [
+            delta_rudder, delta_sail]))
+
+    print("delta", delta)
+    boat[:12] += delta[:12] * delta_time
+    boat[12] += delta[12]
+    print("boat", boat)
+
+    # 二维简化
+    boat[VEL_Z] = 0
+    boat[PITCH_RATE] = 0
+    boat[ROLL_RATE] = 0
+    return boat
+
+
+# 状态变量:boat(wind?time?sail?),其中time这一项在静水环境下并不会影响船体
+# 环境风保存在environment[TRUE_WIND]中
+# 帆角信息保存在environment[SAIL_ANGLE]中
+# 舵角信息保存在environment[RUDDER_ANGLE]中
+# 控制变量:rudder
+
+def MPC_Model(boat, rudder):
+    # 静水环境下time不影响
+    delta_time = 0.3
+    actor_dynamics = False
+    # time = 0
+    time = boat[12]
+    # print("current_time", time)
+
+    # 真实环境中的情景设置，不需要
+    """""""""
+    if not time % int(2 / delta_time):
+        apparent_wind = calculate_apparent_wind(boat[YAW], boat[VEL_X], boat[VEL_Y], environment[TRUE_WIND])
+        environment[SAIL_ANGLE] = sail_angle_1(apparent_wind.angle, apparent_wind.speed, SAIL_STRETCHING)
+    """
+
+    # environment[RUDDER_ANGLE] = rudder
+
+    # 获取状态变量信息
+    pos_x, pos_y, pos_z = boat[POS_X: POS_Z + 1]
+    roll, pitch, yaw = boat[ROLL: YAW + 1]
+    vel_x, vel_y, vel_z = boat[VEL_X: VEL_Z + 1]
+    roll_rate, pitch_rate, yaw_rate = boat[ROLL_RATE: YAW_RATE + 1]
+
+    # 考虑船体力学信息的影响
+    if actor_dynamics:
+        rudder_angle, sail_angle = boat[RUDDER_STATE: SAIL_STATE + 1]
+        # environment unpacking
+        sail_angle_reference = environment[SAIL_ANGLE]  # environment中存储sail_angle位置的元素
+        rudder_angle_reference = environment[RUDDER_ANGLE]  # environment中存储rudder_angle位置的元素
+        # 存储的是上一次的舵角数据
+    else:
+        sail_angle = environment[SAIL_ANGLE]
+        # rudder_angle = environment[RUDDER_ANGLE]
+        rudder_angle = rudder
+
+    wave = environment[WAVE]
+    true_wind = environment[TRUE_WIND]
+
+    """
+    For force calulations needed values
+    运动学信息、力学信息
+    """
+    # 实际船速
+    # 只考虑二维平面中速度
+    speed = sqrt(vel_x ** 2 + vel_y ** 2)  # + vel_z**2)
+    # 波浪影响
+    wave_influence = calculate_wave_influence(pos_x, pos_y, yaw, wave, time)
+    # 视风
+    apparent_wind = calculate_apparent_wind(yaw, vel_x, vel_y, true_wind)
+
+    # sail angle is determined from rope length and wind direction
+    # 顺/逆风 × 帆角的绝对值
+    true_sail_angle = np.sign(apparent_wind.angle) * abs(sail_angle)
+
+    # Force calculation
+    # 阻尼
+    damping = calculate_damping(vel_x, vel_y, vel_z, roll_rate, pitch_rate, yaw_rate)
+    # 流体静力
+    hydrostatic_force, x_hs, y_hs = calculate_hydrostatic_force(pos_z, roll, pitch, wave_influence)
+
+    # 波浪阻抗
+    wave_impedance = calculate_wave_impedance(vel_x, speed)
+    # 龙骨力
+    rudder_force = calculate_rudder_force(speed, rudder_angle)
+    # 横向力
+    lateral_force, lateral_separation = calculate_lateral_force(vel_x, vel_y, roll, speed)
+    # lateral_separation = 0
+    sail_force = calculate_sail_force(roll, apparent_wind, true_sail_angle)
+
+    # Calculate changes
+    # 位置一阶导数
+    delta_pos_x = vel_x * cos(yaw) - vel_y * sin(yaw)
+    delta_pos_y = vel_y * cos(yaw) + vel_x * sin(yaw)
+    delta_pos_z = vel_z
+    # 角度一阶导数
+    delta_roll = roll_rate
+    delta_pitch = pitch_rate * cos(roll) - yaw_rate * sin(roll)
+    delta_yaw = yaw_rate * cos(roll) + pitch_rate * sin(roll)
+
+    # 位置二阶导数
+    delta_vel_x = delta_yaw * vel_y + (
+            sail_force.x + lateral_force.x + rudder_force.x + damping.x + wave_impedance + hydrostatic_force.x) / MASS
+
+    delta_vel_y = -delta_yaw * vel_x + \
+                  ((sail_force.y + lateral_force.y + rudder_force.y) * cos(roll) +
+                   hydrostatic_force.y +
+                   damping.y) / MASS
+
+    delta_vel_z = ((sail_force.y + lateral_force.y + rudder_force.y) * sin(roll) +
+                   hydrostatic_force.z - GRAVITY_FORCE + damping.z) / MASS
+    # MASS * GRAVITY + damping.z) / MASS
+
+    # 角度二阶导数
+    delta_roll_rate = (hydrostatic_force.z * y_hs
+                       - sail_force.y * SAIL_PRESSURE_POINT_HEIGHT
+                       + damping.roll) / MOI_X
+
+    delta_pitch_rate = (sail_force.x * SAIL_PRESSURE_POINT_HEIGHT
+                        - hydrostatic_force.z * x_hs * cos(roll)
+                        + damping.pitch
+                        - (MOI_X - MOI_Z) * roll_rate * yaw_rate) / MOI_Y
+
+    delta_yaw_rate = (damping.yaw
+                      # + hydrostatic_force.z * hydrostatic_force.x * sin(roll)
+                      - rudder_force.y * DISTANCE_COG_RUDDER
+                      + sail_force.y * DISTANCE_COG_SAIL_PRESSURE_POINT
+                      + sail_force.x * sin(true_sail_angle) * DISTANCE_MAST_SAIL_PRESSURE_POINT
+                      + lateral_force.y * (DISTANCE_COG_KEEL_PRESSURE_POINT * (1 - lateral_separation)
+                                           + DISTANCE_COG_KEEL_MIDDLE * lateral_separation)) / MOI_Z
+
+    ##############################################################
+    # 考虑动态参数
+    if actor_dynamics:
+        print("b_rudder", rudder_angle)
+        print("e_rudder", rudder_angle_reference)
+        # actor dynamics
+        # delta_rudder是船实际的舵角和本次action的期望舵角的差值
+        delta_rudder = - 2 * (rudder_angle - rudder_angle_reference)
+        max_rudder_speed = pi / 30
+        # if delta_rudder > max_rudder_speed:
+        # print delta_rudder, max_rudder_speed
+        delta_rudder = np.clip(delta_rudder, -max_rudder_speed, max_rudder_speed)
+        print("delta_rudder", delta_rudder)
+        print("plus", rudder_angle + delta_rudder)
+
+        delta_sail = - .1 * (sail_angle - sail_angle_reference)
+        max_sail_speed = pi / 10
+        delta_sail = np.clip(delta_sail, -max_sail_speed, max_sail_speed)
+    ##############################################################
+
+    # delta中，保存了船体速度和角度的一阶信息和二阶信息
+    # 以全局坐标为参考系
+    delta = np.array(
+        [delta_pos_x, delta_pos_y, delta_pos_z,
+         delta_roll, delta_pitch, delta_yaw,
+         delta_vel_x, delta_vel_y, delta_vel_z,
+         delta_roll_rate, delta_pitch_rate, delta_yaw_rate, delta_time])
+
+    if actor_dynamics:
+        delta = np.concatenate((delta, [
+            delta_rudder, delta_sail]))
+
+    boat = boat + delta * delta_time
+
+    # 二维简化
+    boat[VEL_Z] = 0
+    boat[PITCH_RATE] = 0
+    boat[ROLL_RATE] = 0
+    return delta
+
+
+# 定义成本函数
+def cost_function(boat, x_target):
+    x = np.array(boat[0], boat[1])
+    # 示例成本函数：最小化状态与目标状态之间的欧几里得距离
+    return np.linalg.norm(x - x_target)
+
+
+# 定义 MPC 控制器
+def mpc_controller(boat, x_target, N):
+    # 初始控制输入
+    u_init = np.zeros(N)
+
+    # 定义控制输入的约束条件
+    bounds = [(-30 * 180 / pi, 30 * 180 / pi) for _ in range(N)]
+
+    # 定义状态约束条件
+    # constraints = ({'type': 'ineq', 'fun': lambda u: x0 + np.sum(u) - x_target})  # 示例：确保状态达到目标
+
+    # 最小化成本函数
+    # result = minimize(cost_function, u_init, args=(boat, x_target), method='SLSQP', bounds=bounds,
+    #                  constraints=constraints)
+
+    # 最小化成本函数
+    result = minimize(cost_function, u_init, args=(boat,), method='SLSQP', bounds=bounds)
+
+    # 提取最优控制输入
+    u_opt = result.x
+
+    return u_opt
+
+
+"""""""""
+# 示例使用
+x0 = np.array([0, 0, 0])  # 初始状态
+x_target = np.array([10, 10, 10])  # 目标状态
+N = 10  # 预测时域
+
+# 运行 MPC 控制器
+u_opt = mpc_controller(x0, x_target, N)
+print("最优控制输入:", u_opt)
+
+# 使用最优控制输入模拟系统
+x_new = system_dynamics(x0, u_opt)
+print("新状态:", x_new)
+"""
+
+wind = TrueWind(0, 5, 5, pi / 2)
+t_end = 150.  # 模拟终止时间
+sail_sampletime = 2.  # 反应时间
+environment[SAIL_ANGLE] = 0. / 180 * pi
+environment[RUDDER_ANGLE] = 0
+environment[WAVE] = Wave(50, 0, 0)
+environment[TRUE_WIND] = wind
+x0 = zeros(13)
+x0[VEL_X] = 0.
+
+x_target = np.array([10, 10])  # 目标状态
+
+N = 13
+state_array = []
+
+# 进行轨迹控制
+for _ in range(N):
+
+    # 获取最优的控制输入
+    # u_opt = mpc_controller(x0, x_target, N)
+    u_opt = 0
+
+    # 更新船的状态
+    x0 = system_dynamics(x0, u_opt)
+    # print(x0)
+
+    temp_position = (x0[0], x0[1])
+    state_array.append(temp_position)
+    # 检查是否达到目标状态
+    if np.linalg.norm(x0[:2] - x_target) < 0.2:  # 例如，如果状态向量的前两个元素表示位置，则这里计算位置的欧几里得距离
+        print("Reached the target!")
+        break
+
+_, _ = plot_series(state_array, end_point=x_target, title='trajectory Plot', xlabel='pos_x',
+                   ylabel='pos_y', label='trajectory',
+                   legend=True)
+plt.show()
+
