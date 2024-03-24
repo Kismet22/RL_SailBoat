@@ -253,11 +253,13 @@ class Boat_Environment(gym.Env):
         self.state = x0
         ########
 
+        """""""""
         ########
         # 积分器更新
         integrator = init_integrator(x0)
         self.integrator = integrator  # 运动更新器
         ########
+        """
 
 
         ########
@@ -328,6 +330,7 @@ class Boat_Environment(gym.Env):
 
         # 船体舵角(action1)
         # 舵角根据强化学习调整
+        # environment[RUDDER_ANGLE] = pi * 15 / 180 # 固定角度
         rudder = environment[RUDDER_ANGLE]
         # print('rudder_angle', rudder)
 

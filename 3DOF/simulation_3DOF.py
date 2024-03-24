@@ -322,19 +322,6 @@ def calculate_wave_impedance(vel_x, speed):
     return -sign(vel_x) * speed ** 2 * (speed / HULL_SPEED) ** 2 * WAVE_IMPEDANCE_INVARIANT
 
 
-def calculate_wave_impedance_ca(vel_x, speed):
-    # 波浪阻抗
-    ''' Calculate the wave impedance.
-
-    param vel_x: The velocity along the x-axis  [m/s]
-    param speed: The total speed of the boat    [m/s]
-
-    return: The force applied to the rudder of the boat
-    '''
-    return -ca.if_else(vel_x > 0, 1, ca.if_else(vel_x < 0, -1, 0)) * speed ** 2 * (
-            speed / HULL_SPEED) ** 2 * WAVE_IMPEDANCE_INVARIANT
-
-
 def calculate_wave_influence(pos_x, pos_y, yaw, wave, time):
     # 波浪影响
     # 静水时恒为0
@@ -556,6 +543,7 @@ INITIAL_RUDDER_ANGLE = param_dict['simulator']['initial']['rudder_angle']
 # 初始化状态
 state = initial_state()
 
+###################################################################################################
 # 环境给定
 environment = [INITIAL_SAIL_ANGLE,
                INITIAL_RUDDER_ANGLE,

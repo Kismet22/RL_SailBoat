@@ -16,9 +16,8 @@ print(path.shape, np.linspace(0, 2, 21).shape)
 path = np.vstack([path, np.linspace(0, 2, 21) + t0])
 print(path.shape)
 
+
 import casadi
-
-
 # this is a workaround for issue #2743:
 # it shoud be obsolete for casadi version >= 3.6
 
