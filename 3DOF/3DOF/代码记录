@@ -1,0 +1,51 @@
+from scipy.integrate import solve_ivp
+import numpy as np
+
+
+def _get_v(t, loc):
+    x, y = loc
+    u = 1
+    v = 1
+    return np.array([u, v])
+
+
+# 定义右侧函数
+def rhs(t, y, action):
+    print("Time:", t)
+    print("State:", y)
+    return _get_v(t, y) + action
+
+
+# 设置初始条件
+init_t = 0
+l = 0
+dt = 1
+s = np.array([0, 0])
+action = [0, 1]
+
+# 解微分方程
+time = init_t + l * dt
+sol = solve_ivp(lambda t, y: rhs(t, y, action), (time, time + dt), s, max_step=dt / 10)
+
+# 打印解
+print("Solution:", sol)
+
+
+
+###################################################################################################
+# 环境给定
+env = [0, 0, TrueWind(50 * cos(np.pi / 2), 50 * sin(np.pi / 2), 50, np.pi / 2),
+       Wave(direction=50, length=50, amplitude=0)]
+###################################################################################################
+
+
+# Usage example
+time_span = (0, 0.3)  # Define the time span for integration
+initial_boat_state = np.array([0, 0, 0, 0, 0, 0])  # Initial boat state
+
+# Solve the ODE using solve_ivp
+solution = solve_ivp(lambda t, y: _solve_ivp(t, y, env), time_span, initial_boat_state,
+                     max_step=0.3 / 10)
+
+# Print the solution
+print("Solution:", solution)
